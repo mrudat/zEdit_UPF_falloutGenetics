@@ -1,0 +1,12 @@
+{
+  "id": "falloutGeneticsPatcher",
+  "name": "Fallout Genetics Patcher",
+  "author": "gl0w1ngsw0rd + Martin Rudat",
+  "version": "1.0.1",
+  "released": "2018-10-16",
+  "updated": "2020-05-18",
+  "description": "Randomises NPC appearance in Fallout 4",
+  "requires": ["unifiedPatchingFramework"],
+  "moduleLoader": "UPF",
+  "canHotLoad": true
+}
