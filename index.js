@@ -1,6 +1,7 @@
 /* global fh, info, patcherUrl, patcherPath, registerPatcher, xelib */
 
 const assert = require('assert').strict
+const crypto = require('crypto')
 
 const {
   jetpack,
@@ -24,13 +25,14 @@ const {
   GetWinningOverride,
   gmFO4,
   HasElement,
-  IsWinningOverride,
   LongName,
   RemoveElement,
   SetFloatValue,
   SetIntValue,
   SetLinksTo,
-  SetValue
+  SetValue,
+  WithHandle,
+  WithHandles
 } = xelib
 
 // from https://en.wikipedia.org/wiki/SRGB
@@ -44,10 +46,51 @@ function RGBtosRGB (u) {
 }
 
 function setLinksTo (element, path, target) {
-  SetLinksTo(AddElement(element, path), target, '')
+  WithHandle(AddElement(element, path), (handle) => SetLinksTo(handle, target, ''))
 }
 
-const crypto = require('crypto')
+function _parseIntColor (value) {
+  return {
+    red: sRGBtoRGB(value & 0xff),
+    green: sRGBtoRGB((value >>> 8) & 0xff),
+    blue: sRGBtoRGB((value >>> 16) & 0xff)
+  }
+}
+
+function parseColor (colorString, logMessage) {
+  switch (typeof colorString) {
+    case 'number':
+      return _parseIntColor(colorString)
+    case 'string': {
+      const firstChar = colorString.charAt(0)
+      if (firstChar === 'r') {
+        const temp = colorString.split('(', 2)
+        if (temp[0] === 'rgba') {
+          const rgba = temp[1].split(',')
+          return {
+            red: sRGBtoRGB(parseInt(rgba[0])),
+            green: sRGBtoRGB(parseInt(rgba[1])),
+            blue: sRGBtoRGB(parseInt(rgba[2])),
+            alpha: parseInt(rgba[3])
+          }
+        } if (temp[0] === 'rgb') {
+          const rgb = temp[1].split(',')
+          return {
+            red: sRGBtoRGB(parseInt(rgb[0])),
+            green: sRGBtoRGB(parseInt(rgb[1])),
+            blue: sRGBtoRGB(parseInt(rgb[2]))
+          }
+        }
+      } else if (colorString.match(/#[0-9A-Fa-f]{6}/)) {
+        return _parseIntColor(parseInt(colorString.slice(1), 16))
+      } else if (colorString.match(/\d+/)) {
+        return _parseIntColor(parseInt(colorString, 16))
+      }
+    }
+  }
+  logMessage(`[WARN] Not sure how to parse the color ${colorString}`)
+  return false
+}
 
 function Random (edid, seed) {
   const edidbuf = Buffer.alloc(255 + 4)
@@ -213,8 +256,6 @@ const RAIDER_FACTION = 'RaiderFaction "Raiders" [FACT:0001CBED]'
 const SETTLER_FACTION = 'WorkshopNPCFaction [FACT:000337F3]'
 const COA_FACTION = 'ChildrenOfAtomFaction [FACT:0002FB84]'
 
-const APPLY_FACE_TINTS = true
-
 registerPatcher({
   info: info,
   gameModes: [gmFO4],
@@ -227,13 +268,18 @@ registerPatcher({
       useMorphs: true,
       seed: 42,
       beardChance: 5,
-      femaleParts: 'f',
-      maleParts: 'm'
+      applyFoundation: true,
+      applyMakeup: false,
+      paleLipstickColor: 139,
+      darkLipstickColor: 4916319
     }
   },
   execute: (patchFile, helpers, settings, locals) => ({
     initialize: function () {
       const { logMessage } = helpers
+
+      locals.paleLipstickColor = parseColor(settings.paleLipstickColor)
+      locals.darkLipstickColor = parseColor(settings.darkLipstickColor)
 
       const femaleData = locals.femaleData = {}
       const maleData = locals.maleData = {}
@@ -366,18 +412,8 @@ registerPatcher({
                 const alpha = GetFloatValue(templateColor, 'Alpha')
                 const index = GetValue(templateColor, 'Index')
                 const colorValue = GetValue(clfm, 'CNAM')
-                const color = {}
-                const temp = colorValue.split('(', 2)
-                if (temp[0] === 'rgba') {
-                  const rgba = temp[1].split(',')
-                  color.red = sRGBtoRGB(parseInt(rgba[0]))
-                  color.green = sRGBtoRGB(parseInt(rgba[1]))
-                  color.blue = sRGBtoRGB(parseInt(rgba[2]))
-                  color.alpha = parseInt(rgba[3])
-                } else {
-                  logMessage(`[WARN] Not sure how to parse ${colorValue}, skipping.`)
-                  continue
-                }
+                const color = parseColor(colorValue)
+                if (!color) continue
                 colors.push({
                   color: color,
                   alpha: alpha,
@@ -427,7 +463,7 @@ registerPatcher({
                 target = 'Raiders'
                 if (HasElement(option, 'Conditions')) {
                   for (const condition of GetElements(option, 'Conditions')) {
-                    if (GetValue(condition, 'Function') === 'GetGlobalValue') {
+                    if (GetValue(condition, 'CTDA\\Function') === 'GetGlobalValue') {
                       if (EditorID(GetLinksTo(condition, 'CTDA\\Global')) === 'AtomFacePaints') {
                         target = 'ChildrenOfAtom'
                       }
@@ -459,7 +495,7 @@ registerPatcher({
 
       if (settings.useMorphs) {
         const presetPath = jetpack.cwd(patcherPath).cwd('presets')
-        assert.ok(presetPath.exists('.') === 'dir', 'Could not find presets directory. Reinstall?')
+        assert.ok(presetPath.exists('.') === 'dir', 'Could not find presets directory, reinstall?')
 
         const fPresets = femaleData.presets = []
         const mPresets = maleData.presets = []
@@ -485,7 +521,7 @@ registerPatcher({
         filter: function (npc) {
           if (settings.ignoreCharGen && isCharGen(npc)) return false
           if (GetValue(npc, 'RNAM') !== 'HumanRace "Human" [RACE:00013746]') return false
-          return IsWinningOverride(npc)
+          return true
         }
       },
       patch: function (npc, helpers, settings, locals) {
@@ -493,22 +529,26 @@ registerPatcher({
         logMessage(`Changing appearance of ${LongName(npc)}`)
         const { femaleData, maleData, defaultFemaleHDPTs, defaultMaleHDPTs } = locals
         const random = Random(EditorID(npc), settings.seed)
-        RemoveElement(npc, 'Head Parts')
-        const headParts = AddElement(npc, 'Head Parts')
-        const headPartPath = arrayPath()
-        const addHeadPart = (headPart) => setLinksTo(headParts, headPartPath(), headPart)
         const isFemale = GetIsFemale(npc)
         const data = isFemale ? femaleData : maleData
-        const defaultHDPTs = isFemale ? defaultFemaleHDPTs : defaultMaleHDPTs
-        defaultHDPTs.forEach(addHeadPart)
-        for (const type of requiredHeadPartTypes) {
-          pickOne(data[type], random, addHeadPart)
-        }
-        if (!isFemale) {
-          if (random(100) <= settings.beardChance) {
-            pickOne(maleData['Facial Hair'], random, addHeadPart)
+
+        const headPartPath = arrayPath()
+        RemoveElement(npc, 'Head Parts')
+        WithHandle(AddElement(npc, 'Head Parts'), (headParts) => {
+          // const headParts = AddElement(npc, 'Head Parts')
+          const addHeadPart = (headPart) => setLinksTo(headParts, headPartPath(), headPart)
+
+          const defaultHDPTs = isFemale ? defaultFemaleHDPTs : defaultMaleHDPTs
+          defaultHDPTs.forEach(addHeadPart)
+          for (const type of requiredHeadPartTypes) {
+            pickOne(data[type], random, addHeadPart)
           }
-        }
+          if (!isFemale) {
+            if (random(100) <= settings.beardChance) {
+              pickOne(maleData['Facial Hair'], random, addHeadPart)
+            }
+          }
+        })
 
         pickOne(data.hairColors, random, (color) => setLinksTo(npc, 'HCLF', color))
         RemoveElement(npc, 'BCLF')
@@ -527,50 +567,61 @@ registerPatcher({
           const w = (value1, value2) => weight * (value1 || 0) + (1 - weight) * (value2 || 0)
 
           RemoveElement(npc, 'Face Morphs')
-          const faceMorphs = AddElement(npc, 'Face Morphs')
-          const faceMorphPath = arrayPath()
-          convolve(
-            parent1.Regions,
-            parent2.Regions,
-            [0, 0, 0, 0, 0, 0, 0],
-            (morphIndex, value1, value2) => {
-              const faceMorph = AddElement(faceMorphs, faceMorphPath())
-              // FIXME validate that morphIndex is valid for gender?
-              // TODO find matching morphIndex for opposite gender?
-              SetValue(faceMorph, 'FMRI', morphIndex)
-              const values = AddElement(faceMorph, 'FMRS')
-
-              FMRSFields.forEach((fieldName, index) => {
-                SetFloatValue(values, fieldName, w(value1[index], value2[index]))
-              })
-            }
-          )
+          WithHandle(AddElement(npc, 'Face Morphs'), (faceMorphs) => {
+            const faceMorphPath = arrayPath()
+            convolve(
+              parent1.Regions,
+              parent2.Regions,
+              [0, 0, 0, 0, 0, 0, 0],
+              (morphIndex, value1, value2) => {
+                WithHandle(AddElement(faceMorphs, faceMorphPath()), (faceMorph) => {
+                  // FIXME validate that morphIndex is valid for gender?
+                  // TODO find matching morphIndex for opposite gender?
+                  SetValue(faceMorph, 'FMRI', morphIndex)
+                  WithHandle(AddElement(faceMorph, 'FMRS'), (values) => {
+                    FMRSFields.forEach((fieldName, index) => {
+                      SetFloatValue(values, fieldName, w(value1[index], value2[index]))
+                    })
+                  })
+                })
+              }
+            )
+          })
 
           RemoveElement(npc, 'MSDK')
           RemoveElement(npc, 'MSDV')
-          const MSDK = AddElement(npc, 'MSDK')
-          const MSDV = AddElement(npc, 'MSDV')
-          convolve(
-            parent1.Presets,
-            parent2.Presets,
-            0,
-            (key, value1, value2) => {
-              SetValue(AddElement(MSDK, '.'), key)
-              SetFloatValue(AddElement(MSDV, '.'), w(value1, value2))
+          WithHandles(
+            [AddElement(npc, 'MSDK'), AddElement(npc, 'MSDV')],
+            ([MSDK, MSDV]) => {
+              convolve(
+                parent1.Presets,
+                parent2.Presets,
+                0,
+                (key, value1, value2) => {
+                  WithHandles(
+                    [AddElement(MSDK, '.'), AddElement(MSDV, '.')],
+                    ([msdk, msdv]) => {
+                      SetValue(msdk, key)
+                      SetFloatValue(msdv, w(value1, value2))
+                    }
+                  )
+                }
+              )
             }
           )
 
-          const mrsv = AddElement(npc, 'MRSV')
-          const value1 = parent1.Values || []
-          const value2 = parent2.Values || []
-          MRSVFields.forEach((fieldName, index) => {
-            SetFloatValue(mrsv, fieldName, w(value1[index], value2[index]))
+          WithHandle(AddElement(npc, 'MRSV'), (mrsv) => {
+            const value1 = parent1.Values || []
+            const value2 = parent2.Values || []
+            MRSVFields.forEach((fieldName, index) => {
+              SetFloatValue(mrsv, fieldName, w(value1[index], value2[index]))
+            })
           })
 
           RemoveElement(npc, 'FMIN')
         }
 
-        if (!GetIsUnique(npc) && APPLY_FACE_TINTS) {
+        if (!GetIsUnique(npc)) {
           const tintData = data.tints
           const baseTints = []
           // stuff hidden by concealer
@@ -651,40 +702,48 @@ registerPatcher({
 
           const factions = new Set()
           if (HasElement(npc, 'Factions')) {
-            for (const faction of GetElements(npc, 'Factions')) {
-              factions.add(GetValue(faction))
-            }
+            WithHandles(GetElements(npc, 'Factions'), (factionArray) => {
+              for (const faction of factionArray) {
+                factions.add(GetValue(faction, 'Faction'))
+              }
+            })
           }
 
           if (isFemale && factions.has(SETTLER_FACTION)) {
-            concealer = true
+            if (settings.applyFoundation) {
+              concealer = true
+              if (settings.applyMakeup) {
+                {
+                  const lipstick = tintData.Lipstick[0]
 
-            {
-              const lipstick = tintData.Lipstick[0]
+                  const w = (value1, value2) => lightness * value1 + (1 - lightness) * value2
 
-              const w = (value1, value2) => lightness * value1 + (1 - lightness) * value2
+                  const paleColor = locals.paleLipstickColor
+                  const darkColor = locals.darkLipstickColor
 
-              surfaceTints.push({
-                type: 'Value/Color',
-                index: lipstick.index,
-                templateColor: -1,
-                value: 1.0,
-                red: RGBtosRGB(w(1.0, 0.5)),
-                green: RGBtosRGB(w(0.25, 0.0)),
-                blue: RGBtosRGB(w(0.25, 0.25))
-              })
+                  surfaceTints.push({
+                    type: 'Value/Color',
+                    index: lipstick.index,
+                    templateColor: -1,
+                    value: 1.0,
+                    red: RGBtosRGB(w(paleColor.red, darkColor.red)),
+                    green: RGBtosRGB(w(paleColor.green, darkColor.green)),
+                    blue: RGBtosRGB(w(paleColor.blue, darkColor.blue))
+                  })
+                }
+
+                // Lip Gloss/Matte
+                pickOne(tintData.Lips, random, (data) => {
+                  surfaceTints.push({
+                    type: 'Value',
+                    index: data.index,
+                    value: randomf(random)
+                  })
+                })
+                // TODO Eyeliner 1 - black.
+                // TODO eye shadow dependent on eye color
+              }
             }
-
-            // Lip Gloss/Matte
-            pickOne(tintData.Lips, random, (data) => {
-              surfaceTints.push({
-                type: 'Value',
-                index: data.index,
-                value: randomf(random)
-              })
-            })
-            // TODO Eyeliner 1 - black.
-            // TODO eye shadow dependent on eye color
           }
 
           if (!factions.has(SETTLER_FACTION)) {
@@ -741,37 +800,45 @@ registerPatcher({
           // TODO Bruising - using melee weapons?
 
           RemoveElement(npc, 'Face Tinting Layers')
-          const faceTints = AddElement(npc, 'Face Tinting Layers')
+          WithHandle(AddElement(npc, 'Face Tinting Layers'), (faceTints) => {
+            const layerPath = arrayPath()
 
-          const layerPath = arrayPath()
-
-          const applyTint = (tint) => {
-            const layer = AddElement(faceTints, layerPath())
-            SetValue(layer, 'TETI\\Data Type', tint.type)
-            SetValue(layer, 'TETI\\Index', tint.index)
-            // displayed as a float, stored as an integer percentage
-            SetIntValue(layer, 'TEND\\Value', tint.value * 100)
-            if (tint.type === 'Value/Color') {
-              SetIntValue(layer, 'TEND\\Template Color Index', tint.templateColor)
-              SetIntValue(layer, 'TEND\\Color\\Red', tint.red)
-              SetIntValue(layer, 'TEND\\Color\\Green', tint.green)
-              SetIntValue(layer, 'TEND\\Color\\Blue', tint.blue)
+            const applyTint = (tint) => {
+              WithHandle(AddElement(faceTints, layerPath()), (layer) => {
+                WithHandles(
+                  [GetElement(layer, 'TETI'), GetElement(layer, 'TEND')],
+                  ([teti, tend]) => {
+                    SetValue(teti, 'Data Type', tint.type)
+                    SetValue(teti, 'Index', tint.index)
+                    // displayed as a float, stored as an integer percentage
+                    SetIntValue(tend, 'Value', tint.value * 100)
+                    if (tint.type === 'Value/Color') {
+                      SetIntValue(tend, 'Template Color Index', tint.templateColor)
+                      WithHandle(GetElement(tend, 'Color'), (color) => {
+                        SetIntValue(color, 'Red', tint.red)
+                        SetIntValue(color, 'Green', tint.green)
+                        SetIntValue(color, 'Blue', tint.blue)
+                      })
+                    }
+                  }
+                )
+              })
             }
-          }
 
-          baseTints.forEach(applyTint)
-          if (concealer) {
-            // don't apply blemishes
-            // minimise scars
-            scarTints.forEach((tint) => {
-              tint.value = tint.value / 4
-              applyTint(tint)
-            })
-          } else {
-            blemishTints.forEach(applyTint)
-            scarTints.forEach(applyTint)
-          }
-          surfaceTints.forEach(applyTint)
+            baseTints.forEach(applyTint)
+            if (concealer) {
+              // don't apply blemishes
+              // minimise scars
+              scarTints.forEach((tint) => {
+                tint.value = tint.value / 4
+                applyTint(tint)
+              })
+            } else {
+              blemishTints.forEach(applyTint)
+              scarTints.forEach(applyTint)
+            }
+            surfaceTints.forEach(applyTint)
+          })
         }
       }
     }]
